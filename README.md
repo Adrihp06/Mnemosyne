@@ -47,7 +47,7 @@ graph TD
     B --> C{Need more info?}
     C -- Yes --> D[Formulate Query]
     D --> E[Hybrid Search Tool]
-    E --> F[Qdrant (Dense + Sparse)]
+    E --> F["Qdrant (Dense + Sparse)"]
     F --> G[Rerank Results]
     G --> H[Observation]
     H --> B
