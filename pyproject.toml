@@ -1,0 +1,28 @@
+[project]
+name = "mnemosyne"
+version = "0.1.0"
+description = "CLI tool for detecting duplicate Bug Bounty reports using Claude Sonnet 4.5, Qdrant, and hybrid vector search"
+readme = "README.md"
+authors = [
+    { name = "Adrian Hernandez Padron", email = "adrianhdezp10@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.39.0",
+    "qdrant-client>=1.12.0",
+    "fastembed>=0.4.0",
+    "flashrank>=0.2.0",
+    "typer[all]>=0.12.0",
+    "pydantic>=2.9.0",
+    "python-dotenv>=1.0.0",
+    "loguru>=0.7.0",
+    "rich>=13.7.0",
+    "pydantic-settings>=2.12.0",
+]
+
+[project.scripts]
+mnemosyne = "mnemosyne.main:app"
+
+[build-system]
+requires = ["uv_build>=0.8.14,<0.9.0"]
+build-backend = "uv_build"

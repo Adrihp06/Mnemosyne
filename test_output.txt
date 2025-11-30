@@ -1,0 +1,25 @@
+2025-11-30 12:04:11.970 | INFO     | mnemosyne.agents.react:__init__:51 - ReactAgent initialized with model: claude-sonnet-4-5-20250929
+2025-11-30 12:04:11.970 | INFO     | mnemosyne.agents.react:search_duplicates:170 - Starting duplicate detection for: Test Vulnerability...
+2025-11-30 12:04:11.970 | INFO     | mnemosyne.agents.react:search_duplicates:185 - ReAct iteration 1/5
+2025-11-30 12:04:11.970 | INFO     | mnemosyne.agents.react:search_duplicates:202 - API response - stop_reason: tool_use, usage: <MagicMock name='mock.usage.model_dump()' id='4614386560'>
+2025-11-30 12:04:11.971 | ERROR    | mnemosyne.agents.react:_execute_tool:154 - Unknown tool: <MagicMock name='hybrid_search.name' id='4614388768'>
+2025-11-30 12:04:11.971 | INFO     | mnemosyne.agents.react:search_duplicates:185 - ReAct iteration 2/5
+2025-11-30 12:04:11.971 | INFO     | mnemosyne.agents.react:search_duplicates:202 - API response - stop_reason: end_turn, usage: <MagicMock name='mock.usage.model_dump()' id='4614449216'>
+2025-11-30 12:04:11.971 | INFO     | mnemosyne.agents.react:search_duplicates:247 - Agent reached final answer
+2025-11-30 12:04:11.971 | INFO     | mnemosyne.agents.react:_parse_final_answer:352 - Parsing final answer from agent
+2025-11-30 12:04:11.971 | SUCCESS  | mnemosyne.agents.react:_parse_final_answer:370 - Decision: DUPLICATE (is_duplicate=True, score=0.950)
+F
+======================================================================
+FAIL: test_candidates_in_result (__main__.TestDuplicateDetection.test_candidates_in_result)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/Users/adrihp06/Github/Projects/Mnemosyne/reproduce_issue.py", line 78, in test_candidates_in_result
+    self.assertTrue(len(result.candidates) > 0, "Candidates list should not be empty")
+AssertionError: False is not true : Candidates list should not be empty
+
+----------------------------------------------------------------------
+Ran 1 test in 0.003s
+
+FAILED (failures=1)
+
+Result candidates: 0
