@@ -37,7 +37,7 @@ A **Claude Sonnet 4.5** agent orchestrates the process using the **ReAct pattern
 | **Sparse** | `Qdrant/bm25` | Keyword/Payload matching. |
 | **Vector DB** | **Qdrant** | Storage and hybrid search execution. |
 | **Reranker** | `ms-marco-TinyBERT-L-2-v2` | High-precision re-ranking of top candidates. |
-| **Framework** | **Custom ReAct** | Agent loop implementation. |
+| **Framework** | **Claude Agent SDK** | ReAct agent implementation with MCP tools and hooks. |
 
 ## 🔄 Agent Workflow
 
