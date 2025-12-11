@@ -37,7 +37,7 @@ A **Claude Sonnet 4.5** agent orchestrates the process using the **ReAct pattern
 | **Sparse** | `Qdrant/bm25` | Keyword/Payload matching. |
 | **Vector DB** | **Qdrant** | Storage and hybrid search execution. |
 | **Reranker** | `ms-marco-TinyBERT-L-2-v2` | High-precision re-ranking of top candidates. |
-| **Framework** | **LangChain / Custom ReAct** | Agent loop implementation. |
+| **Framework** | **Custom ReAct** | Agent loop implementation. |
 
 ## 🔄 Agent Workflow
 
@@ -59,7 +59,7 @@ graph TD
 
 *   **🔴 Duplicate:** Score > **0.85** (Same vulnerability, same component, same payload).
 *   **🟡 Similar:** Score **0.65 - 0.85** (Related vulnerability or component, but different context).
-*   **🟢 New:** Score < **0.65** (No relevant matches found).
+*   **🟢 New:** Score < **0.65** (No relevant tches found).
 
 ## 🚀 Key Features
 

@@ -1,6 +1,6 @@
 [project]
 name = "mnemosyne"
-version = "0.1.0"
+version = "0.2.0"
 description = "CLI tool for detecting duplicate Bug Bounty reports using Claude Sonnet 4.5, Qdrant, and hybrid vector search"
 readme = "README.md"
 authors = [
@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.39.0",
+    "claude-agent-sdk>=0.1.0",
     "qdrant-client>=1.12.0",
     "fastembed>=0.4.0",
     "flashrank>=0.2.0",

@@ -1,15 +1,30 @@
 """
-ReAct agent for iterative duplicate detection.
+ReAct agent for iterative duplicate detection using Claude Agent SDK.
 
-Uses Claude Sonnet 4.5 with tool calling to search for duplicates
-through multiple iterations of reasoning and searching.
+Uses Claude Sonnet 4.5 with Claude Agent SDK to search for duplicates
+through multiple iterations of reasoning and searching, with declarative
+hooks for early stopping and query validation.
 """
 
+import asyncio
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from anthropic import Anthropic
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    HookContext,
+    HookInput,
+    HookJSONOutput,
+    HookMatcher,
+    ResultMessage,
+    TextBlock,
+    ToolUseBlock,
+    create_sdk_mcp_server,
+    tool,
+)
 from loguru import logger
 
 from mnemosyne.config import get_settings
@@ -17,272 +32,438 @@ from mnemosyne.core.search import get_searcher
 from mnemosyne.models.schema import (
     DuplicateDetectionResult,
     NormalizedReport,
-    SearchResult,
 )
+
+
+# ============================================================================
+# GLOBAL SEARCHER INSTANCE & METADATA STORE
+# ============================================================================
+
+_searcher = None
+
+# Store for tool metadata (SDK doesn't pass _metadata to hooks)
+_last_tool_metadata: Dict[str, Any] = {}
+
+
+def get_tool_searcher():
+    """Lazy-load searcher for tool usage."""
+    global _searcher
+    if _searcher is None:
+        _searcher = get_searcher()
+    return _searcher
+
+
+def set_last_tool_metadata(metadata: Dict[str, Any]) -> None:
+    """Store metadata from the last tool execution for hooks to access."""
+    global _last_tool_metadata
+    _last_tool_metadata = metadata
+
+
+def get_last_tool_metadata() -> Dict[str, Any]:
+    """Retrieve metadata from the last tool execution."""
+    return _last_tool_metadata
+
+
+# ============================================================================
+# TOOL DEFINITION: hybrid_search
+# ============================================================================
+
+
+@tool(
+    "hybrid_search",
+    "Search for similar security reports using hybrid vector search (dense semantic + sparse BM25). Returns a list of candidate reports with similarity scores.",
+    {"query": str, "limit": int},
+)
+async def hybrid_search_tool(args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Herramienta de búsqueda híbrida para el agente ReAct.
+
+    Args:
+        args: Dict con 'query' (str) y 'limit' (int, opcional)
+
+    Returns:
+        Dict con formato compatible con Claude Agent SDK
+    """
+    query = args.get("query", "")
+    limit = args.get("limit", 20)
+
+    logger.info(f"[Tool] Executing hybrid_search: '{query[:100]}...' (limit={limit})")
+
+    try:
+        searcher = get_tool_searcher()
+
+        # Paso 1: Hybrid search
+        results = searcher.hybrid_search(query_text=query, limit=limit)
+
+        # Paso 2: Re-ranking si hay resultados
+        if results:
+            reranked = searcher.rerank_results(
+                query=query, candidates=results, top_k=min(10, len(results))
+            )
+        else:
+            reranked = []
+
+        # Formatear respuesta para Claude
+        if not reranked:
+            # Store metadata globally for hooks (SDK doesn't pass _metadata)
+            set_last_tool_metadata({
+                "result_count": 0,
+                "top_score": 0.0,
+                "candidates": [],
+            })
+            return {
+                "content": [{"type": "text", "text": "No results found."}],
+            }
+
+        # Construir observación detallada
+        observation_lines = [f"Found {len(reranked)} candidates:\n"]
+
+        for i, result in enumerate(reranked[:10], 1):
+            report = result.report
+            observation_lines.append(
+                f"{i}. [Score: {result.score:.3f}] {report.title}\n"
+                f"   Type: {report.vulnerability_type}\n"
+                f"   Component: {report.affected_component}\n"
+                f"   Summary: {report.summary[:150]}...\n"
+                f"   Report ID: {result.report_id}\n"
+            )
+
+        observation = "\n".join(observation_lines)
+
+        # Store metadata globally for hooks (SDK doesn't pass _metadata)
+        metadata = {
+            "result_count": len(reranked),
+            "top_score": reranked[0].score,
+            "top_report_id": reranked[0].report_id,
+            "candidates": [
+                {
+                    "report_id": r.report_id,
+                    "score": r.score,
+                    "title": r.report.title,
+                    "type": r.report.vulnerability_type,
+                }
+                for r in reranked
+            ],
+        }
+        set_last_tool_metadata(metadata)
+
+        # Return content for Claude
+        return {
+            "content": [{"type": "text", "text": observation}],
+        }
+
+    except Exception as e:
+        logger.error(f"[Tool] hybrid_search failed: {e}")
+        set_last_tool_metadata({"result_count": 0, "top_score": 0.0, "error": str(e)})
+        return {
+            "content": [{"type": "text", "text": f"Error during search: {str(e)}"}],
+            "is_error": True,
+        }
+
+
+# ============================================================================
+# HOOKS: PreToolUse and PostToolUse
+# ============================================================================
+
+
+async def query_validation_hook(
+    input_data: HookInput, tool_use_id: Optional[str], context: HookContext
+) -> HookJSONOutput:
+    """
+    Hook opcional para validar queries antes de ejecutar hybrid_search.
+
+    Útil para:
+    - Detectar queries demasiado cortas
+    - Prevenir búsquedas vacías
+    """
+    tool_name = input_data.get("tool_name", "")
+
+    # Solo aplicar a hybrid_search
+    if tool_name != "mcp__dedup__hybrid_search":
+        return {}
+
+    tool_input = input_data.get("tool_input", {})
+    query = tool_input.get("query", "")
+
+    # Validación: query muy corta
+    if len(query.strip()) < 5:
+        logger.warning(
+            f"[PreToolUse Hook] Query too short: '{query}' (length={len(query)})"
+        )
+
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    "Query is too short (< 5 characters). "
+                    "Please provide a more descriptive search query."
+                ),
+            }
+        }
+
+    # Query válida - permitir ejecución
+    logger.debug(f"[PreToolUse Hook] Query validation passed: '{query[:50]}...'")
+    return {}
+
+
+async def early_stopping_hook(
+    input_data: HookInput, tool_use_id: Optional[str], context: HookContext
+) -> HookJSONOutput:
+    """
+    Hook de early stopping cuando score > 0.9.
+
+    Este hook se ejecuta DESPUÉS de que hybrid_search retorna resultados.
+    Si encuentra un candidato con score > 0.9, detiene la ejecución inmediatamente.
+    """
+    tool_name = input_data.get("tool_name", "")
+
+    # Solo aplicar a hybrid_search
+    if tool_name != "mcp__dedup__hybrid_search":
+        return {}
+
+    # Get metadata from global store (SDK doesn't pass _metadata to hooks)
+    metadata = get_last_tool_metadata()
+
+    top_score = metadata.get("top_score", 0.0)
+    top_report_id = metadata.get("top_report_id")
+    result_count = metadata.get("result_count", 0)
+
+    logger.debug(
+        f"[PostToolUse Hook] Checking early stopping: "
+        f"top_score={top_score:.3f}, threshold=0.9"
+    )
+
+    # Early stopping condition
+    if top_score > 0.9 and top_report_id:
+        logger.success(
+            f"[PostToolUse Hook] EARLY STOPPING triggered! "
+            f"Found high confidence match (score={top_score:.3f})"
+        )
+
+        # Construir mensaje de resultado final
+        candidates = metadata.get("candidates", [])
+        top_candidate = candidates[0] if candidates else {}
+
+        final_message = f"""
+High confidence duplicate detected (score: {top_score:.3f})!
+
+Matched Report ID: {top_report_id}
+Title: {top_candidate.get('title', 'N/A')}
+Type: {top_candidate.get('type', 'N/A')}
+
+This is a DUPLICATE with very high confidence. No additional searches needed.
+
+FINAL ANSWER:
+{{
+  "is_duplicate": true,
+  "confidence": "high",
+  "matched_report_id": "{top_report_id}",
+  "similarity_score": {top_score},
+  "status": "duplicate",
+  "reasoning": "Early stopping triggered due to high confidence match (score > 0.9)",
+  "search_iterations": 1,
+  "key_findings": [
+    "Found exact match with score {top_score:.3f}",
+    "Same vulnerability type and affected component"
+  ]
+}}
+"""
+
+        return {
+            "continue_": False,  # DETENER ejecución
+            "stopReason": "early_stopping_high_confidence_match",
+            "systemMessage": final_message,
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "earlyStoppingTriggered": True,
+                "matchScore": top_score,
+                "matchedReportId": top_report_id,
+            },
+        }
+
+    # No early stopping - continuar normalmente
+    return {"continue_": True}
+
+
+# ============================================================================
+# REACT SDK AGENT CLASS
+# ============================================================================
 
 
 class ReactAgent:
     """
-    ReAct (Reasoning + Acting) agent for duplicate detection.
+    ReAct Agent implementado con Claude Agent SDK.
 
-    Uses Claude with tool calling to iteratively search for duplicates
-    using different strategies until reaching a conclusive answer.
+    Migración de la implementación manual de react.py usando el SDK oficial.
     """
 
     def __init__(self, api_key: Optional[str] = None):
         """
-        Initialize the ReAct agent.
+        Initialize the ReAct SDK agent.
 
         Args:
             api_key: Optional Anthropic API key (uses settings if not provided)
         """
-        settings = get_settings()
-        self.api_key = api_key or settings.anthropic_api_key
-        self.client = Anthropic(api_key=self.api_key)
+        self.settings = get_settings()
+        self.api_key = api_key or self.settings.anthropic_api_key
         self.model = "claude-sonnet-4-5-20250929"
-        self.max_iterations = settings.react_max_iterations
-        self.searcher = get_searcher()
 
-        # Load system prompt
-        prompt_path = Path(__file__).parent.parent.parent.parent / "prompts" / "react_agent.md"
+        # Cargar system prompt
+        prompt_path = (
+            Path(__file__).parent.parent.parent.parent / "prompts" / "react_agent.md"
+        )
         with open(prompt_path, "r", encoding="utf-8") as f:
             self.system_prompt = f.read()
 
-        logger.info(f"ReactAgent initialized with model: {self.model}")
+        # Crear MCP server in-process con nuestra herramienta
+        self.mcp_server = create_sdk_mcp_server(
+            name="dedup", version="1.0.0", tools=[hybrid_search_tool]
+        )
 
-    def _build_tool_definition(self) -> Dict:
+        logger.info(f"ReactAgent initialized with Claude Agent SDK")
+
+    def _build_agent_options(self) -> ClaudeAgentOptions:
         """
-        Build the tool definition for hybrid_search.
+        Construir opciones de configuración para ClaudeSDKClient.
 
         Returns:
-            Tool definition dict for Claude API
+            ClaudeAgentOptions configurado
         """
-        return {
-            "name": "hybrid_search",
-            "description": (
-                "Search for similar security reports using hybrid vector search "
-                "(dense semantic + sparse BM25). Returns a list of candidate reports "
-                "with similarity scores."
-            ),
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": (
-                            "Search query text. Can be vulnerability description, "
-                            "payloads, code snippets, component names, etc."
-                        ),
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return",
-                        "default": 20,
-                    },
-                },
-                "required": ["query"],
+        return ClaudeAgentOptions(
+            # MCP Server con nuestra herramienta
+            mcp_servers={"dedup": self.mcp_server},
+            # Permitir solo hybrid_search
+            allowed_tools=["mcp__dedup__hybrid_search"],
+            # System prompt del agente ReAct
+            system_prompt=self.system_prompt,
+            # Modelo
+            model=self.model,
+            # Límites
+            max_turns=self.settings.react_max_iterations,  # 5 iteraciones
+            max_budget_usd=None,  # Sin límite de presupuesto
+            # Hooks
+            hooks={
+                "PreToolUse": [
+                    HookMatcher(
+                        matcher="mcp__dedup__hybrid_search",
+                        hooks=[query_validation_hook],
+                    )
+                ],
+                "PostToolUse": [
+                    HookMatcher(
+                        matcher="mcp__dedup__hybrid_search",
+                        hooks=[early_stopping_hook],
+                    )
+                ],
             },
-        }
+            # Permisos (no necesitamos editar archivos)
+            permission_mode="default",
+            # Streaming
+            include_partial_messages=False,  # No necesitamos mensajes parciales
+        )
 
-    def _execute_tool(self, tool_name: str, tool_input: Dict) -> Tuple[str, Optional[DuplicateDetectionResult]]:
-        """
-        Execute a tool and return the observation.
-
-        Args:
-            tool_name: Name of the tool to execute
-            tool_input: Input parameters for the tool
-
-        Returns:
-            Tuple containing:
-            - Formatted observation string
-            - Optional DuplicateDetectionResult (if early stopping condition met)
-        """
-        if tool_name == "hybrid_search":
-            query = tool_input.get("query", "")
-            limit = tool_input.get("limit", 20)
-
-            logger.info(f"Executing hybrid_search: '{query[:100]}...' (limit={limit})")
-
-            # Perform hybrid search + re-ranking
-            results = self.searcher.hybrid_search(query_text=query, limit=limit)
-
-            # Re-rank top results
-            if results:
-                reranked = self.searcher.rerank_results(
-                    query=query,
-                    candidates=results,
-                    top_k=min(10, len(results))  # Re-rank top 10
-                )
-            else:
-                reranked = []
-
-            # Format observation for Claude
-            if not reranked:
-                return "No results found.", None
-
-            # Check for early stopping (high confidence match)
-            top_result = reranked[0]
-            if top_result.score > 0.9:
-                logger.success(f"Early stopping: Found high confidence match (score={top_result.score:.3f})")
-                early_result = DuplicateDetectionResult(
-                    is_duplicate=True,
-                    similarity_score=top_result.score,
-                    matched_report_id=top_result.report_id,
-                    matched_report=top_result.report,
-                    status="duplicate",
-                    candidates=[c.model_dump() for c in reranked],
-                )
-                return f"Found high confidence match: {top_result.report.title}", early_result
-
-            observation = f"Found {len(reranked)} candidates:\n\n"
-            for i, result in enumerate(reranked[:10], 1):  # Show top 10
-                report = result.report
-                observation += (
-                    f"{i}. [Score: {result.score:.3f}] {report.title}\n"
-                    f"   Type: {report.vulnerability_type}\n"
-                    f"   Component: {report.affected_component}\n"
-                    f"   Summary: {report.summary[:150]}...\n"
-                    f"   Report ID: {result.report_id}\n\n"
-                )
-
-            return observation, None
-
-        else:
-            logger.error(f"Unknown tool: {tool_name}")
-            return f"Error: Unknown tool '{tool_name}'", None
-
-    def search_duplicates(
+    async def search_duplicates(
         self, new_report: NormalizedReport, raw_text: str
     ) -> DuplicateDetectionResult:
         """
-        Search for duplicates of a new report using iterative ReAct pattern.
+        Search for duplicates using Claude Agent SDK with ReAct pattern.
 
         Args:
             new_report: The normalized report to check for duplicates
-            raw_text: Original raw text of the report
+            raw_text: Original raw text of the report (no usado actualmente)
 
         Returns:
             DuplicateDetectionResult with detection outcome
         """
-        logger.info(f"Starting duplicate detection for: {new_report.title[:50]}...")
+        logger.info(
+            f"Starting duplicate detection (SDK): {new_report.title[:50]}..."
+        )
 
-        # Build initial message with report details
+        # Construir mensaje inicial con detalles del reporte
         initial_message = self._format_report_for_agent(new_report)
 
-        # Conversation history for ReAct loop
-        messages = [{"role": "user", "content": initial_message}]
+        # Configurar opciones del agente
+        options = self._build_agent_options()
 
-        # Track all candidates found
-        all_candidates: List[SearchResult] = []
+        # Tracking
+        last_assistant_text = ""
+        all_candidates = []
         iterations = 0
 
         try:
-            while iterations < self.max_iterations:
-                iterations += 1
-                logger.info(f"ReAct iteration {iterations}/{self.max_iterations}")
+            async with ClaudeSDKClient(options=options) as client:
+                await client.query(initial_message)
 
-                # Call Claude with tool use
-                response = self.client.messages.create(
-                    model=self.model,
-                    system=[
-                        {
-                            "type": "text",
-                            "text": self.system_prompt,
-                            "cache_control": {"type": "ephemeral"}  # Cache system prompt
-                        }
-                    ],
-                    messages=messages,
-                    tools=[self._build_tool_definition()],
-                    max_tokens=4096,
-                )
+                async for message in client.receive_response():
+                    if isinstance(message, AssistantMessage):
+                        iterations += 1
+                        logger.info(f"[SDK] Iteration {iterations}")
 
-                logger.info(
-                    f"API response - stop_reason: {response.stop_reason}, "
-                    f"usage: {response.usage.model_dump()}"
-                )
+                        # Extraer último texto para parsing
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                last_assistant_text = block.text
+                                logger.debug(
+                                    f"[SDK] Text: {block.text[:200]}..."
+                                )
+                            elif isinstance(block, ToolUseBlock):
+                                logger.info(
+                                    f"[SDK] Tool use: {block.name} (id={block.id})"
+                                )
 
-                # Process response
-                assistant_message = {"role": "assistant", "content": response.content}
-                messages.append(assistant_message)
+                    elif isinstance(message, ResultMessage):
+                        logger.success(
+                            f"[SDK] Conversation finished: "
+                            f"turns={message.num_turns}, "
+                            f"duration={message.duration_ms}ms, "
+                            f"cost=${message.total_cost_usd:.4f}, "
+                            f"stop_reason={message.result}"
+                        )
 
-                # Check if we have a tool use
-                tool_use = None
-                for block in response.content:
-                    if block.type == "tool_use":
-                        tool_use = block
-                        break
+                        # Check for early stopping using metadata (SDK doesn't propagate stopReason)
+                        metadata = get_last_tool_metadata()
+                        if metadata.get("top_score", 0.0) > 0.9 and metadata.get("top_report_id"):
+                            # Early stopping triggered - use metadata directly
+                            logger.info("[SDK] Detected early stopping via high score in metadata")
+                            candidates = metadata.get("candidates", [])
+                            return DuplicateDetectionResult(
+                                is_duplicate=True,
+                                similarity_score=metadata.get("top_score", 0.95),
+                                matched_report_id=metadata.get("top_report_id"),
+                                matched_report=None,
+                                status="duplicate",
+                                candidates=candidates,
+                            )
 
-                if tool_use:
-                    # Execute the tool
-                    observation, early_result = self._execute_tool(
-                        tool_name=tool_use.name,
-                        tool_input=tool_use.input
-                    )
+                        # Respuesta normal del agente
+                        parsed = self._parse_json_from_text(last_assistant_text)
+                        if parsed:
+                            return DuplicateDetectionResult(
+                                is_duplicate=parsed.get("is_duplicate", False),
+                                similarity_score=parsed.get("similarity_score", 0.0),
+                                matched_report_id=parsed.get("matched_report_id"),
+                                matched_report=None,
+                                status=parsed.get("status", "new"),
+                                candidates=all_candidates,
+                            )
 
-                    # Check for early stopping
-                    if early_result:
-                        logger.info("Early stopping triggered by tool execution")
-                        return early_result
+                        # Fallback si no se puede parsear
+                        return self._create_fallback_result()
 
-                    # Add tool result to conversation
-                    messages.append({
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tool_use.id,
-                                "content": observation
-                            }
-                        ]
-                    })
-
-                elif response.stop_reason == "end_turn":
-                    # Agent has finished - extract final answer
-                    logger.info("Agent reached final answer")
-
-                    # Extract text from response
-                    final_text = ""
-                    for block in response.content:
-                        if block.type == "text":
-                            final_text += block.text
-
-                    # Parse final answer
-                    result = self._parse_final_answer(final_text, new_report)
-                    return result
-
-                else:
-                    logger.warning(f"Unexpected stop_reason: {response.stop_reason}")
-                    break
-
-            # Max iterations reached without final answer
-            logger.warning(
-                f"Max iterations ({self.max_iterations}) reached without conclusive answer"
-            )
-
-            return DuplicateDetectionResult(
-                is_duplicate=False,
-                similarity_score=0.0,
-                matched_report=None,
-                matched_report_id=None,
-                status="similar",
-                candidates=[],
-            )
+            return self._create_fallback_result()
 
         except Exception as e:
-            logger.error(f"ReAct agent failed: {e}")
+            logger.error(f"[SDK] search_duplicates failed: {e}")
             raise
 
     def _format_report_for_agent(self, report: NormalizedReport) -> str:
         """
-        Format a normalized report for the agent's initial message.
+        Formatear reporte para el mensaje inicial del agente.
 
-        Args:
-            report: The normalized report to format
-
-        Returns:
-            Formatted string for Claude
+        MISMO formato que implementación actual en react.py
         """
-        # Extract payloads if present
+        # Extraer payloads si existen
         payloads_text = ""
         if report.technical_artifacts:
             payloads_text = "\n\nTechnical Artifacts:\n"
@@ -330,76 +511,41 @@ Comienza tu análisis."""
         """Format reproduction steps as numbered list."""
         return "\n".join(f"{i}. {step}" for i, step in enumerate(steps, 1))
 
-    def _parse_final_answer(
-        self, response_text: str, new_report: NormalizedReport
-    ) -> DuplicateDetectionResult:
+    def _parse_json_from_text(self, text: str) -> Optional[dict]:
         """
-        Parse the agent's final answer into a DuplicateDetectionResult.
+        Extraer JSON del texto de respuesta de Claude.
 
-        Args:
-            response_text: The agent's final text response
-            new_report: The original report being analyzed
-
-        Returns:
-            DuplicateDetectionResult object
+        Similar a _parse_final_answer() en react.py
         """
-        logger.info("Parsing final answer from agent")
-
         try:
-            # Try to extract JSON from the response
-            # Look for JSON between ```json and ``` or just raw JSON
-            json_start = response_text.find("{")
-            json_end = response_text.rfind("}") + 1
+            # Buscar JSON en el texto
+            json_start = text.find("{")
+            json_end = text.rfind("}") + 1
 
             if json_start >= 0 and json_end > json_start:
-                json_str = response_text[json_start:json_end]
-                answer = json.loads(json_str)
-
-                # Extract fields
-                is_duplicate = answer.get("is_duplicate", False)
-                similarity_score = answer.get("similarity_score", 0.0)
-                matched_id = answer.get("matched_report_id")
-                status = answer.get("status", "new")
-
-                logger.success(
-                    f"Decision: {status.upper()} (is_duplicate={is_duplicate}, "
-                    f"score={similarity_score:.3f})"
-                )
-
-                return DuplicateDetectionResult(
-                    is_duplicate=is_duplicate,
-                    similarity_score=similarity_score,
-                    matched_report_id=matched_id,
-                    matched_report=None,  # Will be populated by caller if needed
-                    status=status,
-                    candidates=[],  # Could be populated with search history
-                )
-
-            else:
-                logger.warning("No JSON found in final answer, using default")
-                return DuplicateDetectionResult(
-                    is_duplicate=False,
-                    similarity_score=0.0,
-                    matched_report=None,
-                    matched_report_id=None,
-                    status="new",
-                    candidates=[],
-                )
-
+                json_str = text[json_start:json_end]
+                return json.loads(json_str)
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON from final answer: {e}")
-            logger.debug(f"Response text: {response_text[:500]}")
+            logger.error(f"[SDK] Failed to parse JSON: {e}")
 
-            # Fallback: return safe default
-            return DuplicateDetectionResult(
-                is_duplicate=False,
-                similarity_score=0.0,
-                matched_report=None,
-                matched_report_id=None,
-                status="new",
-                candidates=[],
-            )
+        return None
 
+    def _create_fallback_result(self) -> DuplicateDetectionResult:
+        """Resultado fallback si no se puede parsear."""
+        logger.warning("[SDK] Using fallback result (parsing failed)")
+        return DuplicateDetectionResult(
+            is_duplicate=False,
+            similarity_score=0.0,
+            matched_report=None,
+            matched_report_id=None,
+            status="new",
+            candidates=[],
+        )
+
+
+# ============================================================================
+# CONVENIENCE FUNCTIONS (Backward Compatibility)
+# ============================================================================
 
 # Global instance (lazy-loaded)
 _agent: Optional[ReactAgent] = None
@@ -432,4 +578,12 @@ def detect_duplicates(
         DuplicateDetectionResult with detection outcome
     """
     agent = get_agent()
-    return agent.search_duplicates(new_report, raw_text)
+
+    # The SDK is async, we need a sync wrapper
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    return loop.run_until_complete(agent.search_duplicates(new_report, raw_text))
